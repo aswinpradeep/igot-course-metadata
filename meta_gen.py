@@ -415,7 +415,9 @@ class LLMClient:
         self.client = client
         self.static_prefix = static_prefix
 
-    async def generate(self, course_section: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    async def generate(
+        self, course_section: str, native_pdfs: Optional[List[Path]] = None
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         prompt = self.static_prefix + course_section
         config = types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -423,9 +425,22 @@ class LLMClient:
             temperature=LLM_TEMPERATURE,
             max_output_tokens=LLM_MAX_OUTPUT_TOKENS,
         )
-        contents = [
-            types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
-        ]
+        parts = [types.Part.from_text(text=prompt)]
+        # Attach PDFs whose text layer was unusable -- scanned (PyMuPDF does no
+        # OCR) or written in a legacy non-Unicode Indic font. The model renders
+        # the pages, which recovers both: a Krutidev-encoded Hindi document that
+        # extracted as "varjkZ\"Vªh; ;ksx" reads correctly as
+        # "अंतर्राष्ट्रीय योग" this way.
+        for path in native_pdfs or []:
+            try:
+                parts.append(
+                    types.Part.from_bytes(
+                        data=path.read_bytes(), mime_type="application/pdf"
+                    )
+                )
+            except OSError as exc:
+                logger.warning("could not attach %s: %s", path, exc)
+        contents = [types.Content(role="user", parts=parts)]
 
         last_exc: Optional[BaseException] = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -561,7 +576,9 @@ class Pipeline:
                 })
                 return True
 
-            raw_record, usage = await self.llm.generate(section)
+            raw_record, usage = await self.llm.generate(
+                section, native_pdfs=content.get("pdf_native")
+            )
 
             record, issues = validate_and_repair(
                 raw_record,
@@ -649,6 +666,7 @@ class Pipeline:
                 "classification": rubric.get("Classification"),
                 "transcript_chars": content["transcript_chars"],
                 "pdf_count": content["pdf_count"],
+                "pdf_sent_natively": len(content.get("pdf_native") or []),
                 "issue_count": len(issues),
                 "issues": " | ".join(issues)[:2000],
                 "prompt_tokens": usage.get("prompt_token_count"),
@@ -934,7 +952,7 @@ def _write_outcome_csv(outcomes: List[Dict[str, Any]], out: Optional[Path]) -> N
         "course_id", "status", "evidence_tier", "primary_area",
         "declared_area", "agrees_with_declared", "functional", "behavioural",
         "domain", "targetroles", "total_score", "classification",
-        "transcript_chars", "pdf_count", "issue_count", "issues",
+        "transcript_chars", "pdf_count", "pdf_sent_natively", "issue_count", "issues",
         "prompt_tokens", "cached_tokens", "output_tokens", "seconds", "error",
     ]
     with path.open("w", encoding="utf-8", newline="") as fh:

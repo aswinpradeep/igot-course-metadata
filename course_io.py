@@ -44,6 +44,9 @@ CUE_TIME_RE = re.compile(
 MAX_TRANSCRIPT_CHARS = int(os.environ.get("MAX_TRANSCRIPT_CHARS", "400000"))
 MAX_PDF_CHARS = int(os.environ.get("MAX_PDF_CHARS", "200000"))
 MAX_PDFS_PER_COURSE = int(os.environ.get("MAX_PDFS_PER_COURSE", "40"))
+# Rendering PDF pages costs far more than reading a text layer (~30k tokens for a
+# 14.5 MB document vs ~2k for its text), so cap how many one course may send.
+MAX_NATIVE_PDFS = int(os.environ.get("MAX_NATIVE_PDFS", "3"))
 
 
 def is_course_dir(path: Path) -> bool:
@@ -167,6 +170,44 @@ def _module_label(module_dir: Path, course_dir: Path) -> str:
         return module_dir.name
 
 
+# Legacy Indic fonts (Krutidev, Chanakya, Shree Lipi and friends) map Devanagari
+# glyphs onto ASCII codepoints, so a PDF using them yields text that *looks* like
+# content but is gibberish: "varjkZ\"Vªh; ;ksx" is Krutidev for
+# "अन्तर्राष्ट्रीय योग". Feeding that to the model is worse than feeding nothing,
+# because it reads as real text. These trigrams are the encoding's fingerprints,
+# taken from confirmed examples in this corpus.
+_LEGACY_FONT_MARKERS = (
+    "ksx", "fnYyh", "Vªh", "vk;", "izk", "jkT", "'kk", "gksE", "iqfL", "fpfd",
+)
+_EN_STOPWORDS = frozenset(
+    "the of and to in a is for on with as by are that be this or from at an it "
+    "was will not have has been which can may their its all any such other more".split()
+)
+
+
+def pdf_text_is_suspect(text: str) -> bool:
+    """
+    True when extracted text is almost certainly a legacy-font mis-encoding.
+
+    Deliberately narrow. A broader "mostly ASCII and few English words" test was
+    measured against this corpus and did not separate cleanly from legitimate
+    tabular and numeric English PDFs, so it would have discarded real content.
+    This requires all three signals together: overwhelmingly ASCII, essentially
+    no English function words, and at least two known legacy-font fingerprints.
+    """
+    printable = [c for c in text if not c.isspace() and c.isprintable()]
+    if len(printable) < 200:
+        return False
+    if sum(ord(c) < 128 for c in printable) / len(printable) < 0.9:
+        return False  # real native script present
+    words = re.findall(r"[A-Za-z]{2,}", text.lower())
+    if len(words) < 40:
+        return False  # too little to judge
+    if sum(w in _EN_STOPWORDS for w in words) / len(words) >= 0.03:
+        return False  # reads as English
+    return sum(m in text for m in _LEGACY_FONT_MARKERS) >= 2
+
+
 def extract_pdf_text_sync(pdf_path: Path, max_chars: int = MAX_PDF_CHARS) -> str:
     """Extract text from one PDF with PyMuPDF, stopping at max_chars."""
     import fitz  # imported lazily so course_io stays importable without PyMuPDF
@@ -252,6 +293,7 @@ async def extract_course_content(course_dir: Path) -> Dict[str, Any]:
     documents = documents[:MAX_PDFS_PER_COURSE]
 
     pdf_text = ""
+    pdf_native: List[Path] = []   # PDFs to hand to the model as files
     if documents:
         budget = max(1, MAX_PDF_CHARS // len(documents))
         texts = await asyncio.gather(
@@ -262,11 +304,27 @@ async def extract_course_content(course_dir: Path) -> Dict[str, Any]:
                 for _, path, is_sidecar in documents
             )
         )
-        blocks = [
-            f"## Document: {label}\n{t[:budget]}"
-            for (label, _, _), t in zip(documents, texts)
-            if t and t.strip()
-        ]
+        blocks = []
+        for (label, path, is_sidecar), t in zip(documents, texts):
+            usable = bool(t and t.strip())
+            # Hand the PDF to the model directly when its text layer is empty
+            # (scanned: PyMuPDF does no OCR) or mis-encoded (legacy Indic font).
+            # The model renders the pages, so both cases resolve. Only original
+            # PDFs can be re-read this way -- a sidecar has no binary to send.
+            if not is_sidecar and (not usable or pdf_text_is_suspect(t)):
+                if len(pdf_native) < MAX_NATIVE_PDFS:
+                    pdf_native.append(path)
+                    reason = "no text layer" if not usable else "legacy-font encoding"
+                    logger.info(
+                        "%s: sending %s to the model directly (%s)",
+                        course_dir.name, path.name, reason,
+                    )
+                    continue
+                if not usable:
+                    continue  # nothing to contribute and no capacity to render it
+            if usable:
+                blocks.append(f"## Document: {label}\n{t[:budget]}")
+
         pdf_text = "\n\n---\n\n".join(blocks)[:MAX_PDF_CHARS]
         if truncated_pdfs:
             pdf_text += "\n\n[...additional documents omitted...]"
@@ -310,6 +368,7 @@ async def extract_course_content(course_dir: Path) -> Dict[str, Any]:
         # PDFs, and counting only *.pdf there would report 0 and drop the course
         # out of the pdf_only tier.
         "pdf_count": len(documents),
+        "pdf_native": pdf_native,
         "reference_links": links,
         "evidence_tier": tier,
     }
