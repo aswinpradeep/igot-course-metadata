@@ -12,6 +12,7 @@ is preserved for comparison — see [Version coexistence](#version-coexistence).
 ## Contents
 
 - [What it does](#what-it-does)
+- [Inputs you must supply](#inputs-you-must-supply)
 - [Quick start](#quick-start)
 - [How a course is processed](#how-a-course-is-processed)
 - [The input data, as it actually is](#the-input-data-as-it-actually-is)
@@ -31,6 +32,31 @@ Behavioural); SGOS sector mapping; prior-knowledge analysis; transcript analysis
 rubric score; target role bands and specific designations; and a full `explain` audit trail.
 
 Records are written to Postgres (`course_metadata_regenerated`), with a per-run outcome CSV and log.
+
+---
+
+## Inputs you must supply
+
+**This repository contains code only.** The reference masters, course content and framework
+specifications are internal iGOT artefacts and are deliberately not tracked here. Obtain them from the
+iGOT/Karmayogi team, place them anywhere on disk, and point `.env` at them.
+
+| Input | What it is | `.env` variable |
+|---|---|---|
+| `competencies*.json` | KCM master — the **only** valid source of Functional and Behavioural competencies. 114 Theme/SubTheme pairs (73 Functional, 41 Behavioural). Identical to the `cbp-ai-service` service's `data/competencies.json` (md5 `b021990a65365834cfb60bb702fcb0a4`). | `KCM_PATH` |
+| `SGOS*.json` | Sector → SubSector → Theme master — the **only** valid source of Domain classification. 11 sectors, 92 subsectors, 460 themes. KCM has no Domain entries, so SGOS *is* the Domain source. | `SGOS_PATH` |
+| `igot_designations*.csv` | Official iGOT designation master, columns `id,name` (19,936 rows). The only permitted source of `Targetroles`. | `DESIGNATIONS_PATH` |
+| `non-scorm-content-*.zip` | Course content: an outer zip of per-batch zips of course folders (~4.3 GB). | `COURSES_BASE_PATH` after extraction |
+| `scorm-content-*.zip` | SCORM course content (~1.2 GB). Not yet wired up — see [Known gaps](#known-gaps). | — |
+| Vertex AI service-account JSON | Needs the Vertex AI User role on the project. | `GOOGLE_APPLICATION_CREDENTIALS` |
+| Postgres | One writable database for output; optionally a second, read-only, for enrichment. Tables are created automatically. | `DB_DSN`, `ENRICHMENT_DSN` |
+
+Derived artefacts, generated locally and also untracked: `manifest.jsonl` (from `tools/inventory.py`)
+and `data/designation_index.npz` (from `tools/build_designation_index.py`).
+
+The framework specification PDFs (TPT v3.4 / v3.5 / AI Output Schema / AI Prompts) are the source of
+the output contract but are internal documents and are not published here. The contract they define is
+described under [Output contract](#output-contract) and [Changes from v3.4](#changes-from-v34).
 
 ---
 
