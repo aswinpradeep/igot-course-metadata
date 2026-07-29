@@ -580,6 +580,55 @@ Courses run concurrently under a semaphore — `--batch-size` (default `MAX_CONC
 claims `WORKER_BATCH_SIZE` rows per round and processes up to `--batch-size` at once. Concurrency
 affects throughput only, never which courses are processed.
 
+### Latency, throughput and cost
+
+Every run prints averages and a projection for the outstanding queue. For a standalone estimate from
+whatever has been generated so far:
+
+```bash
+python tools/estimate.py                  # projects from measured data in the DB
+python tools/estimate.py --concurrency 8
+```
+
+**Measured on 20 courses** (`gemini-3.1-pro-preview`, `--batch-size 4`):
+
+| Tier | n | mean latency | median | input tokens | output | thinking | $/course |
+|---|---|---|---|---|---|---|---|
+| `transcript` | 11 | 204 s | 180 s | 74,189 | 3,239 | 4,275 | $0.2385 |
+| `metadata_only` | 9 | 154 s | 86 s | 54,605 | 2,340 | 3,914 | $0.1843 |
+| blended | 20 | 181 s | — | 65,376 | — | — | **$0.2141** |
+
+Two things are easy to get wrong here:
+
+- **Thinking tokens are billed at the output rate**, and there are *more* of them than of the visible
+  answer (≈4,200 vs ≈3,100 per course). Costing only `candidates_token_count` understates the bill by
+  well over half of the output charge. Both the run summary and the estimator include them.
+- **Per-course latency is not wall-clock ÷ concurrency.** Latency rises as concurrency rises, so the
+  two diverge:
+
+| | |
+|---|---|
+| Mean latency per course, at concurrency 4 | 250 s |
+| Effective wall-clock per course | 74 s |
+| **Measured throughput** | **~50 courses/hour** |
+| Full 3,707 courses at that rate | **~74 hours (3.1 days)** |
+| What `latency ÷ 4` would predict | 47 hours |
+
+The measured rate is **1.6× slower** than the arithmetic implies, so `--batch-size` buys much less
+than proportionally — check the project's quota for the model before raising it. In the 8-course
+timed run, 3 of 8 calls stalled and hit `LLM_TIMEOUT_SECONDS_META` (300 s); the retry then succeeded
+in ~120 s. That is the timeout earning its keep, but it inflates p90 latency to ~420 s.
+
+**Full-run cost: ≈$800** at $2.00/$12.00 per 1M tokens (the `gemini-3.1-pro-preview` ≤200k-prompt
+tier; prompts here run 55k–140k so the higher $4/$18 tier does not apply). Cost is per-course and
+unaffected by concurrency. Prices are configurable — `PRICE_INPUT_PER_M`, `PRICE_OUTPUT_PER_M`,
+`PRICE_CACHED_INPUT_PER_M` — and are only as current as whoever last edited `.env`.
+
+**The single biggest saving available is caching.** The static prefix (system prompt + KCM + SGOS) is
+byte-identical on every call and is most of the 65k-token input. Served from cache it would save
+≈$436 on a full run — **55% of total spend**. `cached_content_token_count` has been 0 in every call so
+far, so this is not yet happening.
+
 ### Resuming
 
 Safe to re-run. Progress lives in `course_processing_checkpoint`:

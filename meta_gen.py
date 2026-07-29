@@ -87,6 +87,15 @@ LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS_META", "300"))
 # Courses left 'in_progress' by a killed worker are reclaimed after this long.
 STALE_CLAIM_MINUTES = int(os.environ.get("STALE_CLAIM_MINUTES", "30"))
 
+# Published USD per 1M tokens, for run cost reporting. Defaults are
+# gemini-3.1-pro-preview at the <=200k-prompt tier ($4/$18 above 200k; our
+# prompts run ~55k-140k so the low tier applies). Verify against
+# cloud.google.com/vertex-ai/generative-ai/pricing -- these are only as current
+# as whoever last edited .env.
+PRICE_INPUT_PER_M = float(os.environ.get("PRICE_INPUT_PER_M", "2.00"))
+PRICE_OUTPUT_PER_M = float(os.environ.get("PRICE_OUTPUT_PER_M", "12.00"))
+PRICE_CACHED_INPUT_PER_M = float(os.environ.get("PRICE_CACHED_INPUT_PER_M", "0.20"))
+
 LLM_PROMPT_VERSION = P.PROMPT_VERSION
 
 # ---------------------------------------------------------------------- logging
@@ -470,9 +479,14 @@ class Pipeline:
         self.stats = {
             "succeeded": 0, "failed": 0, "with_issues": 0, "skipped": 0,
             "prompt_tokens": 0, "output_tokens": 0, "cached_tokens": 0,
+            # Billed as output by thinking models, and easy to miss: it runs
+            # 3.9k-4.6k per course, more than the visible answer itself.
+            "thinking_tokens": 0,
         }
+        self.latencies: List[float] = []
         self.outcomes: List[Dict[str, Any]] = []
         self._outcomes_lock = asyncio.Lock()
+        self.started_at = time.time()
 
     async def _record(self, row: Dict[str, Any]) -> None:
         async with self._outcomes_lock:
@@ -570,6 +584,8 @@ class Pipeline:
             self.stats["prompt_tokens"] += usage.get("prompt_token_count") or 0
             self.stats["output_tokens"] += usage.get("candidates_token_count") or 0
             self.stats["cached_tokens"] += usage.get("cached_content_token_count") or 0
+            self.stats["thinking_tokens"] += usage.get("thoughts_token_count") or 0
+            self.latencies.append(duration)
 
             async with self.pool.acquire() as conn:
                 async with conn.transaction():
@@ -812,7 +828,14 @@ async def run(args: argparse.Namespace) -> None:
                 concurrency=concurrency,
             )
 
-        _report(pipeline.stats)
+        remaining = await count_outstanding(pool) if not dry_run else None
+        _report(
+            pipeline.stats,
+            pipeline.latencies,
+            wall_seconds=time.time() - pipeline.started_at,
+            concurrency=concurrency,
+            remaining=remaining,
+        )
         _write_outcome_csv(pipeline.outcomes, args.out)
     finally:
         await pool.close()
@@ -831,6 +854,18 @@ UPDATE course_processing_checkpoint
    SET status = 'pending', attempts = 0, last_error = NULL, last_updated = now()
  WHERE course_id = ANY($1)
 """
+
+
+COUNT_OUTSTANDING_SQL = """
+SELECT count(*) FROM course_processing_checkpoint
+ WHERE content_set = $1 AND status IN ('pending', 'failed') AND attempts < $2
+"""
+
+
+async def count_outstanding(pool: asyncpg.Pool) -> int:
+    """Courses still to do for this content set — the basis for the projection."""
+    async with pool.acquire() as conn:
+        return int(await conn.fetchval(COUNT_OUTSTANDING_SQL, CONTENT_SET, MAX_ATTEMPTS) or 0)
 
 
 async def already_done(pool: asyncpg.Pool, ids: List[str]) -> set:
@@ -975,17 +1010,97 @@ async def drain(
             logger.info("progress: %d processed this run", processed)
 
 
-def _report(stats: Dict[str, int]) -> None:
-    logger.info("=" * 60)
-    logger.info("RUN SUMMARY (%s)", LLM_PROMPT_VERSION)
-    logger.info("  succeeded         : %d", stats["succeeded"])
-    logger.info("  with issues       : %d", stats["with_issues"])
-    logger.info("  failed            : %d", stats["failed"])
-    logger.info("  dry-run previews  : %d", stats["skipped"])
-    logger.info("  prompt tokens     : %s", f"{stats['prompt_tokens']:,}")
-    logger.info("  cached tokens     : %s", f"{stats['cached_tokens']:,}")
-    logger.info("  output tokens     : %s", f"{stats['output_tokens']:,}")
-    logger.info("=" * 60)
+def token_cost(prompt_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
+    """
+    USD for one or more calls.
+
+    `output` must already include thinking tokens: thinking is billed at the
+    output rate, and on this workload it exceeds the visible answer.
+    Cached prompt tokens are billed at the cached rate instead of the full one.
+    """
+    uncached = max(0, prompt_tokens - cached_tokens)
+    return (
+        uncached / 1_000_000 * PRICE_INPUT_PER_M
+        + cached_tokens / 1_000_000 * PRICE_CACHED_INPUT_PER_M
+        + output_tokens / 1_000_000 * PRICE_OUTPUT_PER_M
+    )
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def _report(
+    stats: Dict[str, Any],
+    latencies: List[float],
+    wall_seconds: float,
+    concurrency: int,
+    remaining: Optional[int] = None,
+) -> None:
+    done = stats["succeeded"]
+    billed_output = stats["output_tokens"] + stats["thinking_tokens"]
+
+    logger.info("=" * 66)
+    logger.info("RUN SUMMARY (%s, model %s)", LLM_PROMPT_VERSION, GENAI_MODEL_NAME)
+    logger.info("  succeeded / with issues / failed : %d / %d / %d",
+                done, stats["with_issues"], stats["failed"])
+    if stats["skipped"]:
+        logger.info("  dry-run previews                 : %d", stats["skipped"])
+
+    if not done:
+        logger.info("=" * 66)
+        return
+
+    ordered = sorted(latencies)
+    mean = sum(ordered) / len(ordered)
+    median = ordered[len(ordered) // 2]
+    p90 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.9))]
+
+    # Per-course latency is what one course costs in time; throughput is what the
+    # run achieves with `concurrency` of them overlapping. Only throughput
+    # predicts wall-clock, and the two differ by roughly the concurrency factor.
+    per_hour = done / (wall_seconds / 3600) if wall_seconds > 0 else 0.0
+
+    logger.info("  -- latency (per course) --")
+    logger.info("    mean / median / p90            : %.1fs / %.1fs / %.1fs", mean, median, p90)
+    logger.info("    fastest / slowest              : %.1fs / %.1fs", ordered[0], ordered[-1])
+    logger.info("  -- throughput (concurrency %d) --", concurrency)
+    logger.info("    wall clock                     : %s", _fmt_duration(wall_seconds))
+    logger.info("    courses/hour                   : %.0f", per_hour)
+    logger.info("    effective seconds/course       : %.1fs", wall_seconds / done)
+
+    logger.info("  -- tokens (mean per course) --")
+    logger.info("    input                          : %s", f"{stats['prompt_tokens'] // done:,}")
+    logger.info("    cached input                   : %s", f"{stats['cached_tokens'] // done:,}")
+    logger.info("    output (answer)                : %s", f"{stats['output_tokens'] // done:,}")
+    logger.info("    output (thinking, billed)      : %s", f"{stats['thinking_tokens'] // done:,}")
+
+    cost = token_cost(stats["prompt_tokens"], billed_output, stats["cached_tokens"])
+    logger.info("  -- cost @ $%.2f/$%.2f per 1M (cached $%.2f) --",
+                PRICE_INPUT_PER_M, PRICE_OUTPUT_PER_M, PRICE_CACHED_INPUT_PER_M)
+    logger.info("    this run                       : $%.2f", cost)
+    logger.info("    mean per course                : $%.4f", cost / done)
+
+    if remaining:
+        eta = remaining / per_hour * 3600 if per_hour > 0 else 0
+        logger.info("  -- projection for %s remaining courses --", f"{remaining:,}")
+        logger.info("    at this throughput             : %s", _fmt_duration(eta))
+        logger.info("    estimated cost                 : $%.2f", cost / done * remaining)
+        if not stats["cached_tokens"]:
+            # The static prefix is identical on every call, so if it were served
+            # from cache the saving is the whole prefix at the cached rate.
+            prefix = stats["prompt_tokens"] // done
+            saving_per_course = token_cost(prefix, 0) - token_cost(prefix, 0, prefix)
+            logger.info("    no cache hits observed; caching the static prefix")
+            logger.info("    could save up to               : $%.2f", saving_per_course * remaining)
+    logger.info("=" * 66)
 
 
 def _install_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
