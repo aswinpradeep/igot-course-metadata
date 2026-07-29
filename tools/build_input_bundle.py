@@ -16,9 +16,6 @@ zip it, so it can be handed to someone offline who just wants to run the script.
         ├── non-scorm/do_<id>/...     course folders, module structure intact
         └── scorm/do_<id>/...
 
-By default PDFs are replaced by "<name>.pdf.txt" sidecars holding their extracted
-text. That is what shrinks the bundle from ~5 GB to a few hundred MB: the PDFs are
-97% of the raw bytes, the largest are scanned images that yield almost no text
 Two modes:
 
   raw (default)  Every file from every course folder, verbatim -- PDF binaries,
@@ -299,6 +296,13 @@ LLM_MAX_OUTPUT_TOKENS=32768
 MAX_TRANSCRIPT_CHARS=400000
 MAX_PDF_CHARS=200000
 MAX_PDFS_PER_COURSE=40
+
+# PDFs whose text layer is unusable (scanned, or legacy non-Unicode Indic fonts
+# that extract as ASCII gibberish) are sent to the model as files instead, which
+# reads them correctly. Rendering pages costs ~30x a text layer, so bound it.
+MAX_NATIVE_PDFS=3
+MAX_NATIVE_PDF_MB=10
+MAX_NATIVE_PDF_PAGES=50
 
 DESIGNATION_EMBED_MODEL=text-embedding-005
 DESIGNATION_EMBED_DIM=768
