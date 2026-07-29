@@ -39,6 +39,7 @@ from course_io import (  # noqa: E402
     VIDEO_SENTINELS,
     VTT_SENTINELS,
     clean_vtt_text,
+    find_course_dirs,
     is_sentinel,
     load_json,
     read_text as _read_text,
@@ -77,8 +78,13 @@ def scan_course(course_dir: Path) -> Dict[str, Any]:
         )
 
     # PDFs sit at do_<moduleid>/<Name>.pdf -- a sibling of the module dir, so a
-    # top-level glob('*.pdf') finds nothing. rglob is required.
+    # top-level glob('*.pdf') finds nothing. rglob is required. A shareable input
+    # bundle carries "<name>.pdf.txt" sidecars instead of the binaries, so count
+    # those too or every such course drops out of the pdf_only tier.
     pdfs = [p for p in sorted(course_dir.rglob("*.pdf")) if p.is_file()]
+    sidecars = [p for p in sorted(course_dir.rglob("*.pdf.txt")) if p.is_file()]
+    have = {p.name for p in sidecars}
+    pdfs = [p for p in pdfs if f"{p.name}.txt" not in have] + sidecars
 
     # pdf_links.txt holds remote portal URLs for PDFs not shipped in the zip.
     pdf_links: List[str] = []
@@ -148,10 +154,7 @@ def main() -> None:
     ap.add_argument("--out", required=True, type=Path)
     args = ap.parse_args()
 
-    course_dirs = [
-        d for batch in sorted(args.staging.iterdir()) if batch.is_dir()
-        for d in sorted(batch.iterdir()) if d.is_dir() and d.name.startswith("do_")
-    ]
+    course_dirs = find_course_dirs(args.staging)
     print(f"scanning {len(course_dirs)} course folders...")
 
     records: List[Dict[str, Any]] = []

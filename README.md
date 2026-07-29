@@ -55,6 +55,45 @@ iGOT/Karmayogi team, place them anywhere on disk, and point `.env` at them.
 Derived artefacts, generated locally and also untracked: `manifest.jsonl` (from `tools/inventory.py`)
 and `data/designation_index.npz` (from `tools/build_designation_index.py`).
 
+### Getting all of that as one shareable bundle
+
+If you already have the raw zips, `tools/build_input_bundle.py` assembles everything into a single
+tidy folder and archives it, so it can be handed to someone offline who just wants to run the script:
+
+```bash
+python tools/build_input_bundle.py                 # build input/ and input.zip
+python tools/build_input_bundle.py --include-pdfs  # byte-complete, ~5 GB
+python tools/build_input_bundle.py --limit 50      # small sample bundle
+```
+
+```
+input/
+├── README.md                     how to run, written for the recipient
+├── env.template                  copy to .env; only 4 lines need editing
+├── masters/
+│   ├── kcm_competencies.json
+│   ├── sgos_sectors.json
+│   └── igot_designations.csv
+├── manifests/
+│   ├── non-scorm.jsonl
+│   └── scorm.jsonl
+└── courses/
+    ├── non-scorm/do_<id>/…
+    └── scorm/do_<id>/…
+```
+
+Both course sets are included, extracted and deduplicated, with the module structure intact.
+`env.template` resolves every path from a single `INPUT_DIR` variable, so the recipient edits four
+lines — `INPUT_DIR`, the service-account path, the project id, and `DB_DSN`.
+
+By default PDFs ship as `<name>.pdf.txt` sidecars holding their extracted text rather than the
+binaries, which is what takes the bundle from ~5 GB to a few hundred MB. The PDFs are 97% of the raw
+bytes (3.8 GB across 2,184 files) and the largest are scanned images that yield almost no text — one
+321 MB, 25-page file produced about 2,900 characters — while extraction is capped at `MAX_PDF_CHARS`
+regardless. `course_io.py` prefers a sidecar when it finds one, so a run against the bundle behaves
+identically. Exporter placeholder files are dropped too, since the pipeline already treats them as
+absent.
+
 The framework specification PDFs (TPT v3.4 / v3.5 / AI Output Schema / AI Prompts) are the source of
 the output contract but are internal documents and are not published here. The contract they define is
 described under [Output contract](#output-contract) and [Changes from v3.4](#changes-from-v34).

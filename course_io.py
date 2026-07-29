@@ -46,6 +46,41 @@ MAX_PDF_CHARS = int(os.environ.get("MAX_PDF_CHARS", "200000"))
 MAX_PDFS_PER_COURSE = int(os.environ.get("MAX_PDFS_PER_COURSE", "40"))
 
 
+def is_course_dir(path: Path) -> bool:
+    """
+    A course folder, as opposed to a batch folder or a module folder.
+
+    All three are named `do_*` or sit in the same tree, so name alone cannot tell
+    them apart. The discriminator is that only a course carries metadata.json
+    directly: a batch dir has none, and a module keeps its own one level deeper,
+    at do_<moduleid>/<Module Name>/metadata.json.
+    """
+    return path.is_dir() and path.name.startswith("do_") and (path / "metadata.json").is_file()
+
+
+def find_course_dirs(base: Path) -> List[Path]:
+    """
+    Course folders under `base`, accepting either layout:
+
+        base/do_<id>/...                  (flat, e.g. the shareable input bundle)
+        base/<batch>/do_<id>/...          (as extracted from the batch zips)
+
+    Never descends into a course, so a module is never mistaken for a course --
+    which silently inflated an early manifest from 12 courses to 93.
+    """
+    if not base.is_dir():
+        return []
+    found: List[Path] = []
+    for child in sorted(base.iterdir()):
+        if not child.is_dir():
+            continue
+        if is_course_dir(child):
+            found.append(child)
+        elif not child.name.startswith("do_"):
+            found.extend(c for c in sorted(child.iterdir()) if is_course_dir(c))
+    return found
+
+
 def read_text(path: Path) -> str:
     """Read a text file, tolerating the mixed encodings in this export."""
     for enc in ("utf-8", "utf-8-sig", "latin-1"):
@@ -196,22 +231,40 @@ async def extract_course_content(course_dir: Path) -> Dict[str, Any]:
     )
 
     # ---- PDFs (depth 2, siblings of the module dirs) -----------------------
+    # A "<name>.pdf.txt" sidecar is used in place of the PDF when present. The
+    # shareable input bundle ships sidecars instead of the binaries: the PDFs are
+    # 97% of the raw bytes (3.8 GB), and the largest are scanned images that yield
+    # almost no text (one 321 MB / 25-page file gave ~2,900 characters), while
+    # extraction is capped at MAX_PDF_CHARS regardless.
     pdf_paths = [p for p in sorted(course_dir.rglob("*.pdf")) if p.is_file()]
-    truncated_pdfs = len(pdf_paths) > MAX_PDFS_PER_COURSE
-    pdf_paths = pdf_paths[:MAX_PDFS_PER_COURSE]
+    sidecars = [p for p in sorted(course_dir.rglob("*.pdf.txt")) if p.is_file()]
+
+    # Don't read a PDF that already has a sidecar.
+    sidecar_stems = {p.name[: -len(".txt")] for p in sidecars}
+    pdf_paths = [p for p in pdf_paths if p.name not in sidecar_stems]
+
+    documents: List[Tuple[str, Path, bool]] = (
+        [(p.stem, p, False) for p in pdf_paths]
+        + [(Path(p.name[: -len(".pdf.txt")]).name, p, True) for p in sidecars]
+    )
+    documents.sort(key=lambda d: d[0])
+    truncated_pdfs = len(documents) > MAX_PDFS_PER_COURSE
+    documents = documents[:MAX_PDFS_PER_COURSE]
 
     pdf_text = ""
-    if pdf_paths:
-        budget = max(1, MAX_PDF_CHARS // len(pdf_paths))
+    if documents:
+        budget = max(1, MAX_PDF_CHARS // len(documents))
         texts = await asyncio.gather(
             *(
-                asyncio.to_thread(extract_pdf_text_sync, p, budget)
-                for p in pdf_paths
+                asyncio.to_thread(read_text, path)
+                if is_sidecar
+                else asyncio.to_thread(extract_pdf_text_sync, path, budget)
+                for _, path, is_sidecar in documents
             )
         )
         blocks = [
-            f"## Document: {p.stem}\n{t}"
-            for p, t in zip(pdf_paths, texts)
+            f"## Document: {label}\n{t[:budget]}"
+            for (label, _, _), t in zip(documents, texts)
             if t and t.strip()
         ]
         pdf_text = "\n\n---\n\n".join(blocks)[:MAX_PDF_CHARS]
@@ -253,7 +306,10 @@ async def extract_course_content(course_dir: Path) -> Dict[str, Any]:
         "modules_total": len(list(course_dir.glob("do_*"))),
         "modules_with_transcript": modules_with_transcript,
         "pdf_text": pdf_text,
-        "pdf_count": len(pdf_paths),
+        # Counts documents, not binaries: a bundle ships text sidecars instead of
+        # PDFs, and counting only *.pdf there would report 0 and drop the course
+        # out of the pdf_only tier.
+        "pdf_count": len(documents),
         "reference_links": links,
         "evidence_tier": tier,
     }

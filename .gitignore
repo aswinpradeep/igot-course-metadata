@@ -9,6 +9,11 @@
 course_data/
 *.zip
 
+# The assembled input bundle and its archive, built by
+# tools/build_input_bundle.py. Shared out of band, never committed.
+input/
+input.zip
+
 # ── Internal iGOT reference data and specifications ──────────────────────────
 # Excluded because this repository is public. These are internal Government of
 # India platform artefacts (the framework/ticket PDFs, the official designation

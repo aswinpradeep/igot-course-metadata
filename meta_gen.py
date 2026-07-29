@@ -703,19 +703,10 @@ def discover_courses() -> List[Tuple[str, Path]]:
         logger.info("discovered %d courses from manifest %s", len(out), COURSE_MANIFEST)
         return out
 
-    found: List[Tuple[str, Path]] = []
     if not COURSES_BASE_PATH.exists():
         logger.error("COURSES_BASE_PATH does not exist: %s", COURSES_BASE_PATH)
-        return found
-    for child in sorted(COURSES_BASE_PATH.iterdir()):
-        if not child.is_dir():
-            continue
-        if child.name.startswith("do_"):
-            found.append((child.name, child))
-        else:  # a batch directory
-            for course in sorted(child.iterdir()):
-                if course.is_dir() and course.name.startswith("do_"):
-                    found.append((course.name, course))
+        return []
+    found = [(d.name, d) for d in course_io.find_course_dirs(COURSES_BASE_PATH)]
     logger.info("discovered %d courses under %s", len(found), COURSES_BASE_PATH)
     return found
 
