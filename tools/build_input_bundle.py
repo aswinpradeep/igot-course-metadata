@@ -19,13 +19,23 @@ zip it, so it can be handed to someone offline who just wants to run the script.
 By default PDFs are replaced by "<name>.pdf.txt" sidecars holding their extracted
 text. That is what shrinks the bundle from ~5 GB to a few hundred MB: the PDFs are
 97% of the raw bytes, the largest are scanned images that yield almost no text
-(one 321 MB / 25-page file gave ~2,900 characters), and the pipeline caps PDF text
-at MAX_PDF_CHARS anyway. course_io.py prefers a sidecar when it finds one, so the
-run is unaffected. Pass --include-pdfs for a byte-complete bundle.
+Two modes:
 
-    python tools/build_input_bundle.py                    # build + zip
+  raw (default)  Every file from every course folder, verbatim -- PDF binaries,
+                 all subtitle files including the per-video "*.mp4.vtt" ones,
+                 exporter placeholders, everything. Only duplicate course folders
+                 are collapsed, since the same course id appears in several
+                 overlapping batch zips. ~5 GB: a faithful copy of the source.
+
+  text-only      PDFs replaced by "<name>.pdf.txt" sidecars holding their
+                 extracted text; redundant "*.mp4.vtt" files and placeholders
+                 dropped. ~180 MB. A run against it behaves identically -- the
+                 pipeline reads english_subtitles.vtt and caps PDF text at
+                 MAX_PDF_CHARS regardless -- but it is not a faithful copy.
+
+    python tools/build_input_bundle.py                    # raw, build + zip
+    python tools/build_input_bundle.py --mode text-only   # slim, ~180 MB
     python tools/build_input_bundle.py --no-zip
-    python tools/build_input_bundle.py --include-pdfs     # full fidelity, ~5 GB
     python tools/build_input_bundle.py --limit 50         # small sample bundle
 """
 
@@ -80,6 +90,31 @@ def dir_size(path: Path) -> int:
 def discover(staging: Path) -> List[Path]:
     """Course folders under a staging dir, whether nested in batches or not."""
     return course_io.find_course_dirs(staging)
+
+
+def _place(item: Path, target: Path, stats: Dict[str, int]) -> None:
+    """
+    Put a file in the bundle. Hardlinks when possible -- the staging tree and the
+    bundle sit on one filesystem, so this is instant and costs no extra disk,
+    while the zip reads content identically. Falls back to a real copy across
+    devices.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(item, target)
+        stats["linked"] += 1
+    except (OSError, NotImplementedError):
+        shutil.copy2(item, target)
+        stats["copied"] += 1
+    stats["files_copied"] += 1
+    stats["bytes_copied"] += item.stat().st_size
+
+
+def copy_course_raw(src: Path, dst: Path, stats: Dict[str, int]) -> None:
+    """Copy one course folder verbatim -- every file, nothing filtered."""
+    for item in src.rglob("*"):
+        if item.is_file():
+            _place(item, dst / item.relative_to(src), stats)
 
 
 def copy_course(src: Path, dst: Path, include_pdfs: bool,
@@ -292,12 +327,15 @@ META_GEN_LOG_LEVEL=INFO
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=ROOT / "input")
-    ap.add_argument("--include-pdfs", action="store_true",
-                    help="copy PDF binaries instead of text sidecars (~5 GB)")
+    ap.add_argument("--mode", choices=["raw", "text-only"], default="raw",
+                    help="raw (default): every file verbatim, ~5 GB. "
+                         "text-only: PDF text sidecars, placeholders dropped, ~180 MB")
     ap.add_argument("--limit", type=int, default=None,
                     help="courses per set, for a small sample bundle")
     ap.add_argument("--no-zip", action="store_true")
     ap.add_argument("--zip-out", type=Path, default=None)
+    ap.add_argument("--compress-level", type=int, default=None,
+                    help="deflate level 0-9 (default 1 for raw, 6 for text-only)")
     args = ap.parse_args()
 
     sets: List[Tuple[str, Path]] = []
@@ -343,18 +381,33 @@ def main() -> int:
         dest.mkdir(parents=True, exist_ok=True)
         stats: Dict[str, int] = {k: 0 for k in (
             "files_copied", "bytes_copied", "pdfs_copied", "pdf_sidecars",
-            "pdfs_no_text", "pdf_bytes_saved", "placeholders_dropped")}
+            "pdfs_no_text", "pdf_bytes_saved", "placeholders_dropped",
+            "linked", "copied")}
 
-        print(f"\ncourses/{name}: {len(courses)} course folder(s)")
-        for i, c in enumerate(courses, 1):
-            copy_course(c, dest / c.name, args.include_pdfs, stats)
+        # Deduplicate by course id: the same course appears in several
+        # overlapping batch zips, and writing each into dest/<id> would otherwise
+        # just overwrite. Keep one copy per id, chosen deterministically.
+        unique: Dict[str, Path] = {}
+        for c in courses:
+            unique.setdefault(c.name, c)
+        dupes = len(courses) - len(unique)
+
+        print(f"\ncourses/{name}: {len(courses)} folder(s) -> {len(unique)} unique"
+              + (f" ({dupes} duplicate id(s) collapsed)" if dupes else ""))
+        for i, (cid, c) in enumerate(sorted(unique.items()), 1):
+            if args.mode == "raw":
+                copy_course_raw(c, dest / cid, stats)
+            else:
+                copy_course(c, dest / cid, False, stats)
             if i % 500 == 0:
-                print(f"  {i}/{len(courses)}")
-        print(f"  files kept        : {stats['files_copied']:,}")
-        print(f"  placeholders drop : {stats['placeholders_dropped']:,}")
-        if args.include_pdfs:
-            print(f"  PDFs copied       : {stats['pdfs_copied']:,}")
-        else:
+                print(f"  {i}/{len(unique)}")
+
+        print(f"  files included    : {stats['files_copied']:,} "
+              f"({human(stats['bytes_copied'])})")
+        if stats["linked"]:
+            print(f"  hardlinked        : {stats['linked']:,} (no extra disk used)")
+        if args.mode == "text-only":
+            print(f"  placeholders drop : {stats['placeholders_dropped']:,}")
             print(f"  PDF text sidecars : {stats['pdf_sidecars']:,}")
             print(f"  PDFs with no text : {stats['pdfs_no_text']:,} (scanned/image-only, omitted)")
             print(f"  bytes saved       : {human(stats['pdf_bytes_saved'])}")
@@ -381,14 +434,21 @@ def main() -> int:
 
     # ---- docs --------------------------------------------------------------
     pdf_note = (
-        "PDF binaries are included in full, so this bundle is byte-complete."
-        if args.include_pdfs else
+        "**This is a raw bundle: every file from every course folder, verbatim** — PDF\n"
+        "binaries, all subtitle files including the per-video `*.mp4.vtt` ones, and the\n"
+        "exporter's placeholder files. The only thing removed is duplicate course folders:\n"
+        "the same course id appears in several of the overlapping source batch zips, so one\n"
+        "copy of each is kept.\n\n"
+        "The pipeline itself reads `metadata.json`, `english_subtitles.vtt`, `*.pdf` and\n"
+        "`pdf_links.txt`, and ignores the rest — but nothing has been withheld."
+        if args.mode == "raw" else
         "**PDFs are shipped as `<name>.pdf.txt` sidecars holding their extracted text,**\n"
-        "not as the original binaries. The PDFs are 97% of the raw bytes and the largest\n"
-        "are scanned images that yield almost no text — one 321 MB, 25-page file produced\n"
-        "about 2,900 characters. The pipeline caps PDF text at `MAX_PDF_CHARS` regardless,\n"
-        "and prefers a sidecar when it finds one, so the run is unaffected. Rebuild with\n"
-        "`--include-pdfs` if you need the originals."
+        "not as the original binaries, and the redundant per-video `*.mp4.vtt` subtitle\n"
+        "files and exporter placeholders have been dropped. The PDFs are 97% of the raw\n"
+        "bytes and the largest are scanned images yielding almost no text — one 321 MB,\n"
+        "25-page file produced about 2,900 characters. The pipeline caps PDF text at\n"
+        "`MAX_PDF_CHARS` regardless and prefers a sidecar when it finds one, so a run\n"
+        "behaves identically. Rebuild without `--mode text-only` for a faithful copy."
     )
     (out / "README.md").write_text(README.replace("__PDF_NOTE__", pdf_note), encoding="utf-8")
     (out / "env.template").write_text(ENV_TEMPLATE, encoding="utf-8")
@@ -401,8 +461,14 @@ def main() -> int:
     if args.no_zip:
         return 0
     zip_path = args.zip_out or out.with_suffix(".zip")
-    print(f"zipping -> {zip_path} (this takes a few minutes)")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    # Level 1 for a raw bundle: it is nearly all PDF, which is already compressed
+    # internally, so higher levels cost minutes of CPU for almost no gain. The
+    # text-only bundle is all text, where level 6 roughly halves it.
+    level = args.compress_level if args.compress_level is not None else (
+        1 if args.mode == "raw" else 6
+    )
+    print(f"zipping -> {zip_path} (deflate level {level}; this takes a few minutes)")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=level) as z:
         files = [f for f in sorted(out.rglob("*")) if f.is_file()]
         for i, f in enumerate(files, 1):
             z.write(f, f.relative_to(out.parent))

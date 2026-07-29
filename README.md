@@ -61,9 +61,9 @@ If you already have the raw zips, `tools/build_input_bundle.py` assembles everyt
 tidy folder and archives it, so it can be handed to someone offline who just wants to run the script:
 
 ```bash
-python tools/build_input_bundle.py                 # build input/ and input.zip
-python tools/build_input_bundle.py --include-pdfs  # byte-complete, ~5 GB
-python tools/build_input_bundle.py --limit 50      # small sample bundle
+python tools/build_input_bundle.py                   # raw: every file verbatim, ~5 GB
+python tools/build_input_bundle.py --mode text-only  # slim: ~180 MB, emailable
+python tools/build_input_bundle.py --limit 50        # small sample bundle
 ```
 
 ```
@@ -82,17 +82,31 @@ input/
     └── scorm/do_<id>/…
 ```
 
-Both course sets are included, extracted and deduplicated, with the module structure intact.
-`env.template` resolves every path from a single `INPUT_DIR` variable, so the recipient edits four
-lines — `INPUT_DIR`, the service-account path, the project id, and `DB_DSN`.
+Both course sets are included, with the module structure intact. `env.template` resolves every path
+from a single `INPUT_DIR` variable, so the recipient edits four lines — `INPUT_DIR`, the
+service-account path, the project id, and `DB_DSN`.
 
-By default PDFs ship as `<name>.pdf.txt` sidecars holding their extracted text rather than the
-binaries, which is what takes the bundle from ~5 GB to a few hundred MB. The PDFs are 97% of the raw
-bytes (3.8 GB across 2,184 files) and the largest are scanned images that yield almost no text — one
-321 MB, 25-page file produced about 2,900 characters — while extraction is capped at `MAX_PDF_CHARS`
-regardless. `course_io.py` prefers a sidecar when it finds one, so a run against the bundle behaves
-identically. Exporter placeholder files are dropped too, since the pipeline already treats them as
-absent.
+**`raw` (default) — a faithful copy, ~5 GB.** Every file from every course folder verbatim: PDF
+binaries, all subtitle files including the per-video `*.mp4.vtt` ones, and the exporter's placeholder
+files. The only thing removed is duplicate course folders — the same course id appears in several of
+the overlapping source batch zips, so one copy of each is kept (3,801 → 3,707 for non-SCORM). Verified
+file-by-file against the source: byte-for-byte identical. Files are hardlinked from the extracted
+staging tree where the filesystem allows, so building the folder costs no extra disk.
+
+**`--mode text-only` — emailable, ~180 MB.** PDFs become `<name>.pdf.txt` sidecars holding their
+extracted text; the redundant `*.mp4.vtt` files and placeholders are dropped. A run against it behaves
+identically, because the pipeline reads `english_subtitles.vtt` and caps PDF text at `MAX_PDF_CHARS`
+regardless, and `course_io.py` prefers a sidecar when it finds one. What makes the 27× difference:
+
+| | |
+|---|---|
+| PDF binaries → extracted text | 4,936 MB (3,041 files) → 47.7 MB |
+| redundant `*.mp4.vtt` subtitles | −99.7 MB — verified that **no** course loses a transcript; every one also has a real `english_subtitles.vtt` |
+| exporter placeholders | −1.0 MB, but ~67,000 files |
+
+The PDFs are image-heavy scans: the largest is 321 MB for 25 pages yielding about 2,900 characters, and
+40 of them yield no text at all. Transcript bytes are identical in both modes (97.6 MB), and PDF text
+extracted through a sidecar matches reading the binary exactly.
 
 The framework specification PDFs (TPT v3.4 / v3.5 / AI Output Schema / AI Prompts) are the source of
 the output contract but are internal documents and are not published here. The contract they define is
