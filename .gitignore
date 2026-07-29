@@ -1,0 +1,45 @@
+# ── Secrets ──────────────────────────────────────────────────────────────────
+.env
+.env.bak
+.env.bak.*
+*-service-account*.json
+*credentials*.json
+
+# ── Course content (gigabytes; distributed separately) ───────────────────────
+course_data/
+*.zip
+
+# ── Internal iGOT reference data and specifications ──────────────────────────
+# Excluded because this repository is public. These are internal Government of
+# India platform artefacts (the framework/ticket PDFs, the official designation
+# master, and the KCM/SGOS masters). Supply them locally and point .env at them;
+# see .env.example. Remove these lines only if the repo is made private and the
+# data is cleared for publication.
+TPT-*.pdf
+igot_designations*.csv
+competencies*.json
+SGOS*.json
+
+# ── Generated artefacts ──────────────────────────────────────────────────────
+logs/
+data/designation_index.npz
+prompt.txt
+
+# ── Reference copies of the legacy service (own repos) ───────────────────────
+legacy_code/
+legacy_updated_2/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Editor / OS ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
