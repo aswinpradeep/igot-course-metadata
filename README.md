@@ -823,10 +823,26 @@ Reference material: the four TPT framework PDFs, and `legacy_code/` + `legacy_up
 - **41% of courses are `metadata_only`.** For those, transcript analysis is legitimately empty and
   confidence is capped at 0.70. No amount of prompting creates evidence that is not there — the
   honest options are to accept lower-confidence records or to source the missing content.
-- **Prompt caching is not yet confirmed.** The prefix is structured for it, but
-  `cached_content_token_count` has been 0 in every observed call. At ~55k static tokens per course
-  across 3,707 courses this is the dominant cost, so explicit context caching is the obvious next
-  optimisation.
+- **Unusable PDFs are handed to the model, within limits.** PyMuPDF does no OCR, so a scanned PDF
+  extracts to nothing; and Indic PDFs in legacy non-Unicode fonts (Krutidev and similar) extract to
+  plausible ASCII gibberish — `varjkZ"Vªh; ;ksx` is Krutidev for `अंतर्राष्ट्रीय योग`, which is worse
+  than nothing because it reads as real text. Both cases are attached to the request as files instead,
+  which the model reads correctly (verified). This fires on 9.93% of the 2,981 PDFs (295 with no text
+  layer, 1 legacy-font) across 111 of 5,130 courses; the other 90% keep the cheap text path.
+  Documents over `MAX_NATIVE_PDF_MB` (10) or `MAX_NATIVE_PDF_PAGES` (50) are skipped rather than sent,
+  since rendering ran ~30k tokens and 383s for one 14.5 MB file. That excludes 25 of the 296 — and
+  note it excludes the *only* legacy-font document found (14.2 MB, 54 pages), so on this corpus the
+  scanned case is covered and the legacy-font case is not. Raising the two limits slightly (15 MB /
+  60 pages) would cover it; both are env vars.
+- **Legacy-font detection favours precision over recall.** A looser "mostly ASCII with few English
+  words" rule was measured against this corpus and did not separate from legitimate tabular English
+  PDFs, so it would have discarded real content. The narrow rule catches 1 PDF where the loose one
+  flagged ~10, so roughly nine still pass through mis-encoded (~0.2% of courses). Widen
+  `_LEGACY_FONT_MARKERS` in `course_io.py` to trade the other way.
+- **Prompt caching is intermittent.** The static prefix is byte-identical on every request, and one
+  observed call reported 90,696 of 91,368 input tokens served from cache — but every earlier call
+  reported zero, with the same prefix. Watch the `cached_tokens` column in the outcome CSV over the
+  first few hundred courses before trusting the reduced cost figure.
 - **Role bands cannot be validated.** The designation master has only `id,name` — no group/band
   column — so Group A/B/C/D assignment stays model-inferred and unchecked.
 - **312 courses are absent from `course_metadata_v3`**, so they have no platform language or duration

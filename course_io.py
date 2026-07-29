@@ -45,8 +45,15 @@ MAX_TRANSCRIPT_CHARS = int(os.environ.get("MAX_TRANSCRIPT_CHARS", "400000"))
 MAX_PDF_CHARS = int(os.environ.get("MAX_PDF_CHARS", "200000"))
 MAX_PDFS_PER_COURSE = int(os.environ.get("MAX_PDFS_PER_COURSE", "40"))
 # Rendering PDF pages costs far more than reading a text layer (~30k tokens for a
-# 14.5 MB document vs ~2k for its text), so cap how many one course may send.
+# 14.5 MB document vs ~2k for its text) and is slow with it -- one such course took
+# 383s against a ~250s average. So cap how many one course may send, and skip
+# documents too large to be worth it at all: past these limits the token spend and
+# latency outweigh what a scanned or mis-encoded document contributes.
 MAX_NATIVE_PDFS = int(os.environ.get("MAX_NATIVE_PDFS", "3"))
+MAX_NATIVE_PDF_MB = float(os.environ.get("MAX_NATIVE_PDF_MB", "10"))
+MAX_NATIVE_PDF_PAGES = int(os.environ.get("MAX_NATIVE_PDF_PAGES", "50"))
+
+_MUPDF_QUIET = False
 
 
 def is_course_dir(path: Path) -> bool:
@@ -208,9 +215,52 @@ def pdf_text_is_suspect(text: str) -> bool:
     return sum(m in text for m in _LEGACY_FONT_MARKERS) >= 2
 
 
+def pdf_page_count(pdf_path: Path) -> int:
+    """Page count, or 0 if the PDF cannot be opened."""
+    try:
+        import fitz
+
+        with fitz.open(str(pdf_path)) as doc:
+            return int(doc.page_count)
+    except Exception:
+        return 0
+
+
+def native_pdf_too_big(pdf_path: Path) -> Optional[str]:
+    """
+    Reason this PDF should not be sent to the model, or None if it is fine.
+
+    Both limits matter independently: a small file can still be hundreds of pages,
+    and a short file can still be hundreds of megabytes of scanned images.
+    """
+    try:
+        size_mb = pdf_path.stat().st_size / 1048576
+    except OSError:
+        return "unreadable"
+    if size_mb > MAX_NATIVE_PDF_MB:
+        return f"{size_mb:.0f} MB > {MAX_NATIVE_PDF_MB:.0f} MB limit"
+    pages = pdf_page_count(pdf_path)
+    if pages > MAX_NATIVE_PDF_PAGES:
+        return f"{pages} pages > {MAX_NATIVE_PDF_PAGES} page limit"
+    return None
+
+
 def extract_pdf_text_sync(pdf_path: Path, max_chars: int = MAX_PDF_CHARS) -> str:
     """Extract text from one PDF with PyMuPDF, stopping at max_chars."""
     import fitz  # imported lazily so course_io stays importable without PyMuPDF
+
+    # MuPDF writes recoverable complaints straight to stderr from C ("cannot
+    # create appearance stream for Screen annotations", broken colour profiles,
+    # malformed page trees). This corpus triggers thousands of them, which buries
+    # the run log. Extraction still succeeds, so silence them once and rely on the
+    # return value plus our own warning for real failures.
+    global _MUPDF_QUIET
+    if not _MUPDF_QUIET:
+        try:
+            fitz.TOOLS.mupdf_display_errors(False)
+        except Exception:
+            pass
+        _MUPDF_QUIET = True
 
     parts: List[str] = []
     total = 0
@@ -312,9 +362,16 @@ async def extract_course_content(course_dir: Path) -> Dict[str, Any]:
             # The model renders the pages, so both cases resolve. Only original
             # PDFs can be re-read this way -- a sidecar has no binary to send.
             if not is_sidecar and (not usable or pdf_text_is_suspect(t)):
+                reason = "no text layer" if not usable else "legacy-font encoding"
+                too_big = native_pdf_too_big(path)
+                if too_big:
+                    logger.info(
+                        "%s: skipping %s (%s, and %s)",
+                        course_dir.name, path.name, reason, too_big,
+                    )
+                    continue
                 if len(pdf_native) < MAX_NATIVE_PDFS:
                     pdf_native.append(path)
-                    reason = "no text layer" if not usable else "legacy-font encoding"
                     logger.info(
                         "%s: sending %s to the model directly (%s)",
                         course_dir.name, path.name, reason,
