@@ -17,6 +17,7 @@ is preserved for comparison — see [Version coexistence](#version-coexistence).
 - [How a course is processed](#how-a-course-is-processed)
 - [The input data, as it actually is](#the-input-data-as-it-actually-is)
 - [Changes from v3.4](#changes-from-v34)
+- [Output examples](#output-examples)
 - [Output contract](#output-contract)
 - [Operations](#operations)
 - [Files](#files)
@@ -322,6 +323,218 @@ visible regression on the platform. Why/how/what coverage is asserted in
 
 **`Behavioural` keeps the British spelling**, matching the `type` values in the KCM master. The spec
 document writes `Behavioral`. Set `BEHAVIOURAL_SPELLING=Behavioral` if a consumer needs it.
+
+---
+
+## Output examples
+
+All excerpts below are **real output** — v3.4 rows from the 368-record baseline, v3.5 rows from the
+pilot run. Long prose fields are elided as `…`; nothing else is edited.
+
+### New in v3.5
+
+`Targetroles` — the headline addition. Objects, not strings, so each row joins back to the designation
+master by id. Every id here was verified present in the 19,936-row master:
+
+```json
+"Targetroles": [
+  { "DesignationId": "DESG-001578", "Name": "Food Analyst",
+    "Confidence": 0.7,
+    "Rationale": "Directly responsible for analyzing food samples, aligning with the course's focus on grain analysis." },
+  { "DesignationId": "DESG-005003", "Name": "Assistant Director (Quality Control)",
+    "Confidence": 0.7,
+    "Rationale": "Oversees quality control processes, which involves understanding and utilizing AI-based grain analysers." },
+  { "DesignationId": "DESG-016550", "Name": "Junior Analyst (Food)",
+    "Confidence": 0.7,
+    "Rationale": "Performs routine food quality testing and would operate such analytical equipment." },
+  { "DesignationId": "DESG-004264", "Name": "Laboratory-In-Charge (Food Processing)",
+    "Confidence": 0.65,
+    "Rationale": "Manages laboratory equipment and testing protocols for food processing and quality assessment." }
+]
+```
+
+`PrimaryCompetencyArea`, `DomainCompetencies`, `Language`, `Version`, `Generator`,
+`ReferenceResources` — from the same record ("Operating the AI-Based Grain Analyser for Quality
+Control"). Note the SGOS triple and `DomainCompetencies` are one decision expressed two ways, and the
+KCM branches are empty because the area is Domain:
+
+```json
+"PrimaryCompetencyArea": {
+  "name": "Domain",
+  "confidence": 0.7,
+  "reason": "The course focuses on the operation of an AI-based grain analyser for food grain procurement and quality control, which directly aligns with the domain-specific mandate of maintaining buffer stocks and price stabilization under the Food and Public Distribution sector."
+},
+"Sector":         "Rural and Agriculture",
+"SubSector":      "Food and Public Distribution",
+"SubSectorTheme": "Buffer Stocks & Price Stabilization",
+"DomainCompetencies": [
+  { "Theme": "Food and Public Distribution", "SubTheme": "Buffer Stocks & Price Stabilization" }
+],
+"FunctionalCompetencies":  [],
+"BehaviouralCompetencies": [],
+
+"Language":  "English",
+"Duration":  "7 Minutes",
+"Version":   "v3.5-advanced",
+"Generator": "iGOT Metadata Regeneration Engine (Vertex AI / Gemini)",
+"ReferenceResources": { "ExtendedLearning": [], "AssignmentsAndPracticeLinks": [] }
+```
+
+### Changed: `explain` went from empty to a usable audit trail
+
+**v3.4** — all four sub-objects are `{}`, in **368 of 368 rows**:
+
+```json
+"explain": {
+  "sgos_reason": "The course's primary focus is on developing the cognitive and strategic skills of game theory …",
+  "missing_info": "No transcript or PDF text was provided. All text-dependent fields are empty …",
+  "mapping_reasons":              {},
+  "designation_inference":        {},
+  "competency_mapping_triggers":  {},
+  "learning_outcomes_validation": {},
+  "version_adherence_check": "1.0",
+  "prior_knowledge_confidence": 0.85
+}
+```
+
+**v3.5** — same fields, now typed and populated:
+
+```json
+"explain": {
+  "primary_area_reason": "The course focuses on secretarial duties, office management, meeting coordination, and file handling, which directly align with the Functional competency area.",
+  "sgos_reason": "Primary area is Functional, hence no SGOS domain mapping is applicable.",
+  "mapping_reasons": [
+    { "Field": "LearningObjectives",
+      "Reason": "Clear, measurable outcomes starting with action verbs are provided in the instructions.",
+      "EvidenceQuote": "Identify the primary duties and responsibilities…" },
+    { "Field": "ExpectedRoleOutcome",
+      "Reason": "Directly trains Personal Assistants and Private Secretaries on their core job responsibilities.",
+      "EvidenceQuote": "equip Personal Assistants (PAs) with the necessary skills" },
+    { "Field": "ExtentOfLearning",
+      "Reason": "Course duration is approximately 1.5 hours with multiple modules.",
+      "EvidenceQuote": "5688.0 seconds" }
+    // … one entry per rubric parameter
+  ],
+  "designation_inference": [
+    { "DesignationId": "DESG-015195", "Name": "Personal Assistant (Secretarial)",
+      "Evidence": "Explicitly mentions 'duties and responsibilities of personal assistant'.",
+      "Confidence": 0.95 }
+  ],
+  "learning_outcomes_validation": {
+    "CoversPurpose": true, "CoversProcess": true, "CoversApplication": true,
+    "BloomVerbsUsed": ["Identify", "Apply", "Demonstrate", "Utilize", "Develop", "Manage"]
+  },
+  "evidence_tier_used": "transcript",
+  "declared_competency_area_for_audit": "Functional",
+  "agrees_with_declared_area": true,
+  "validation_issues": [
+    "BehaviouralCompetencies: cleared - primary area is Functional, cross-category mapping not allowed"
+  ]
+}
+```
+
+`validation_issues`, `evidence_tier_used`, `declared_competency_area_for_audit` and
+`agrees_with_declared_area` are new — they make each record self-describing about how it was produced
+and whether the AI agreed with the source's declared area.
+
+### Changed: `TranscriptAnalysis` keeps the evidence it was asked for
+
+**v3.4** — the prompt asked for per-marker verb, phrase, Bloom level and confidence; the schema
+declared arrays of strings, so it was all discarded:
+
+```json
+"TranscriptAnalysis": {
+  "LearningTone":      { "Value": "Not Available", "Confidence": 0.0 },
+  "CognitiveMarkers":  { "Values": [], "Confidence": 0.0 },
+  "CompetencySignals": { "Values": [], "Confidence": 0.0 },
+  "KeywordsExtracted": { "Values": [], "Confidence": 0.0 }
+}
+```
+
+**v3.5** — typed, and populated because transcripts are now actually read:
+
+```json
+"TranscriptAnalysis": {
+  "LearningTone": { "Value": "Instructional", "Confidence": 0.9 },
+  "CognitiveMarkers": [
+    { "Verb": "Identify",    "EstimatedLevel": 1, "Confidence": 0.9,
+      "ExamplePhrase": "identify the main duties and responsibilities of a personal assistant" },
+    { "Verb": "Apply",       "EstimatedLevel": 3, "Confidence": 0.9,
+      "ExamplePhrase": "Apply systematic procedures for organizing and managing official meetings" },
+    { "Verb": "Demonstrate", "EstimatedLevel": 3, "Confidence": 0.9,
+      "ExamplePhrase": "Demonstrate professional etiquette in handling telephone calls" }
+  ],
+  "CompetencySignals": [
+    { "Category": "Functional", "Theme": "Office Management",
+      "SubTheme": "Office Procedures", "Confidence": 0.95,
+      "TriggerPhrases": ["duties and responsibilities of personal assistant",
+                         "Manual of Office Procedure"] },
+    { "Category": "Functional", "Theme": "Office Management",
+      "SubTheme": "Noting & Drafting of official Communications", "Confidence": 0.9,
+      "TriggerPhrases": ["prepare minutes of the meeting",
+                         "draft of a minute should be in a crisp manner"] }
+  ]
+}
+```
+
+### Changed: `Sector` is null instead of `"Not Applicable"`
+
+**v3.4**, in 214 of 368 rows — a sector-typed field carrying a sentinel string, because the field was
+required while the prompt forbade populating it for non-Domain courses:
+
+```json
+"Sector": "Not Applicable", "SubSector": "Not Applicable", "SubSectorTheme": "Not Applicable"
+```
+
+**v3.5**, for the same situation:
+
+```json
+"Sector": null, "SubSector": null, "SubSectorTheme": null, "DomainCompetencies": []
+```
+
+### Changed: `TargetEmployeeGroups` split into bands + roles
+
+**v3.4** — one object, with the designations as bare strings; the confidence and rationale the prompt
+asked for were dropped on the floor:
+
+```json
+"TargetEmployeeGroups": {
+  "RoleBands": ["Group A", "Group B"],
+  "Designations": ["Deputy Secretary", "Under Secretary", "Section Officer"]
+}
+```
+
+**v3.5** — a flat band array per the spec, with designations moved to master-validated `Targetroles`:
+
+```json
+"TargetEmployeeGroups": ["Group B", "Group C"]
+```
+
+### Changed: rubric totals are computed, not requested
+
+Real v3.5 record. The seven sub-scores are the model's; `TotalScore` and `Classification` are
+recomputed in Python from the configured weights, and `LearningLevel` is forced to match:
+
+```json
+"RubricScoring": {
+  "LearningObjectives": 60, "PriorKnowledge": 0, "BloomTaxonomy": 60,
+  "ComplexityOfContent": 30, "ExpectedRoleOutcome": 50, "ExtentOfLearning": 10,
+  "TargetAudienceAlignment": 40,
+  "TotalScore": 35, "Classification": "Beginner"
+},
+"LearningLevel": "Beginner"
+```
+
+`60(.10) + 0(.05) + 60(.10) + 30(.15) + 50(.20) + 10(.25) + 40(.15) = 35.0` → `35`, and `35 ≤ 45` →
+Beginner. Under the v3.4 weights the same sub-scores total `35.5` → `36` — a similar number, but
+reached with `TargetAudienceAlignment` weighted 0, so its score of 40 contributed nothing at all.
+
+Where the model's own arithmetic or a field disagrees, the correction is applied and recorded, e.g.:
+
+```
+Duration: model said '9 Minutes 34 Seconds', forced to platform value '9 Minutes'
+FunctionalCompetencies: empty although primary area is Functional - nothing in KCM matched
+```
 
 ---
 
