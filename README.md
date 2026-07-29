@@ -643,11 +643,44 @@ Safe to re-run. Progress lives in `course_processing_checkpoint`:
 A restart therefore processes only what is outstanding. Interrupting with Ctrl-C finishes in-flight
 courses and exits cleanly.
 
+### Reviewing the output with non-technical people
+
+`tools/review_report.py` builds a **single self-contained HTML page** — no external assets, no server —
+that can be emailed, dropped on a share, or opened straight off disk.
+
+```bash
+python tools/review_report.py                        # 50 newest courses
+python tools/review_report.py --limit 200 --out qa.html
+python tools/review_report.py --with-issues          # only auto-flagged records
+python tools/review_report.py --tier metadata_only   # weakest-evidence set
+python tools/review_report.py --area Domain
+```
+
+Each course is one card in plain language: the generated summary, description, "what a learner will be
+able to do", competencies, sector, who it is for, target designations with the reasoning behind each,
+and search tags. Collapsed sections hold the original course record for comparison and the full audit
+trail. Anything the validator flagged is shown at the top of the card, and a course where the AI
+disagreed with the source's declared competency area is badged for attention.
+
+Reviewers mark each course **Looks good / Needs changes / Not acceptable** and leave a comment.
+Verdicts save in their browser as they work, so they can stop and come back, and the footer buttons
+download everything as CSV or JSON to hand back. Nothing is uploaded anywhere. Filters cover
+competency area, evidence level, review state and free-text search; a KPI strip and footer show
+"N of M reviewed".
+
 ### What gets recorded
+
+Progress is visible in the log at two levels — a `[n/total]` counter on every course line, and a
+`PROGRESS` line after each batch giving position against the whole content set with an ETA:
+
+```
+[17/3707] do_1134086834354831361 ok in 90.1s tier=transcript area=Functional roles=6 issues=0 …
+PROGRESS 1,204/3,707 done (32.5%) | 17 this run | pending 2,498, failed 5, dead 0, eta 50h 6m at 50/hr
+```
 
 | Where | Contents |
 |---|---|
-| `logs/<date>-<version>.log` | per-course line (timing, tier, area, role count, issue count, token counts), every validation issue at INFO, full tracebacks, run summary |
+| `logs/<date>-<version>.log` | per-course line with `[n/total]` counter (timing, tier, area, role count, issue count, token counts), a `PROGRESS` line per batch, every validation issue at INFO, full tracebacks, run summary with latency/throughput/cost |
 | `logs/meta_gen_<version>_<timestamp>.csv` | one row per course attempted — status, tier, areas, counts, score, tokens, issues, error |
 | `course_metadata_regenerated` | the record, `validation_issues`, `evidence_tier`, `declared_competency_area`, `llm_usage_json`, original metadata |
 | `course_processing_errors` | one row per failure (message capped at 4,000 chars; full trace in the log) |
@@ -696,7 +729,33 @@ the key is idempotent and runs at startup.
 | `designations.py` | designation embedding index, hybrid retrieval, master validation |
 | `tools/inventory.py` | dedup + coverage census, produces `manifest.jsonl` |
 | `tools/build_designation_index.py` | one-off designation index builder |
+| `tools/estimate.py` | project run time and cost from measured data |
+| `tools/review_report.py` | self-contained HTML review page for non-technical sign-off |
 | `.env.example` | every variable, documented |
+
+### Editing the prompt
+
+**All prompt text lives in `prompts_v35.py` and nowhere else** — no instruction text is embedded in the
+worker, the validator, or the extraction code. Within that file:
+
+| What | Where |
+|---|---|
+| The system prompt, in full | `SYSTEM_PROMPT_TEMPLATE` — one contiguous string, numbered sections 1–15 |
+| Learning-outcome wording (the two variants) | `_LO_RULES_UNLABELLED` / `_LO_RULES_WHW` |
+| The output JSON schema | `METADATA_SCHEMA` |
+| Rubric weights and bands | `RUBRIC_WEIGHTS`, `BEGINNER_MAX`, `INTERMEDIATE_MAX` — env-overridable |
+| How the prompt is assembled | `build_static_prefix()` (invariant head) + `build_course_section()` (per course) |
+
+The rubric weights and classification bands are written into the prompt text *and* used for the Python
+recomputation from the same constants, so editing them in one place cannot desynchronise the
+instructions from the scoring.
+
+Two cautions when editing:
+
+- `build_static_prefix()` must stay byte-identical across courses — it is the cacheable prefix. Putting
+  anything course-specific into the system prompt disables caching (≈55% of spend).
+- Changing `PROMPT_VERSION` starts a fresh generation that coexists with the old one rather than
+  overwriting it, which is what you want when comparing prompt edits.
 
 Reference material: the four TPT framework PDFs, and `legacy_code/` + `legacy_updated_2/` (the
 `cbp-ai-service` production service, 4.8.38 and 4.8.39).

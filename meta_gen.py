@@ -487,6 +487,16 @@ class Pipeline:
         self.outcomes: List[Dict[str, Any]] = []
         self._outcomes_lock = asyncio.Lock()
         self.started_at = time.time()
+        # Position within the whole selection, so every course line carries
+        # "[n/total]" and a tail -f shows how far along the run is.
+        self.total_scope = 0
+        self.completed = 0
+
+    def _tick(self) -> str:
+        self.completed += 1
+        if self.total_scope:
+            return f"[{self.completed}/{self.total_scope}]"
+        return f"[{self.completed}]"
 
     async def _record(self, row: Dict[str, Any]) -> None:
         async with self._outcomes_lock:
@@ -608,9 +618,9 @@ class Pipeline:
                     await conn.execute(MARK_DONE_SQL, course_id)
 
             logger.info(
-                "%s ok in %.1fs tier=%s area=%s roles=%d issues=%d "
+                "%s %s ok in %.1fs tier=%s area=%s roles=%d issues=%d "
                 "tokens(in/cached/out)=%s/%s/%s",
-                course_id, duration, tier,
+                self._tick(), course_id, duration, tier,
                 record.get("PrimaryCompetencyArea", {}).get("name"),
                 len(record.get("Targetroles") or []), len(issues),
                 usage.get("prompt_token_count"),
@@ -651,7 +661,9 @@ class Pipeline:
         except Exception as exc:
             self.stats["failed"] += 1
             message = f"{type(exc).__name__}: {exc}"
-            logger.exception("%s FAILED (tier=%s): %s", course_id, tier, message[:300])
+            logger.exception(
+                "%s %s FAILED (tier=%s): %s", self._tick(), course_id, tier, message[:300]
+            )
             await self._record({
                 "course_id": course_id,
                 "status": "failed",
@@ -805,7 +817,10 @@ async def run(args: argparse.Namespace) -> None:
 
         if args.limit:
             courses = courses[: args.limit]
+        pipeline.total_scope = len(courses)
         logger.info("%d course(s) to process, concurrency=%d", len(courses), concurrency)
+        if not dry_run:
+            await log_progress(pool, 0)
 
         if dry_run:
             # Walk the list directly: the DB queue is claim-based, and a dry run
@@ -860,6 +875,37 @@ COUNT_OUTSTANDING_SQL = """
 SELECT count(*) FROM course_processing_checkpoint
  WHERE content_set = $1 AND status IN ('pending', 'failed') AND attempts < $2
 """
+
+# Overall position, so a long run reports "done X of Y" rather than only a
+# count of what this invocation happened to touch.
+PROGRESS_SQL = """
+SELECT count(*)                                            AS total,
+       count(*) FILTER (WHERE status = 'done')             AS done,
+       count(*) FILTER (WHERE status = 'failed')           AS failed,
+       count(*) FILTER (WHERE status = 'dead')             AS dead,
+       count(*) FILTER (WHERE status = 'in_progress')      AS in_progress,
+       count(*) FILTER (WHERE status = 'pending')          AS pending
+  FROM course_processing_checkpoint
+ WHERE content_set = $1
+"""
+
+
+async def log_progress(pool: asyncpg.Pool, this_run: int, per_hour: float = 0.0) -> None:
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow(PROGRESS_SQL, CONTENT_SET)
+    if not r or not r["total"]:
+        return
+    done, total = int(r["done"]), int(r["total"])
+    pct = done / total * 100 if total else 0.0
+    remaining = total - done - int(r["dead"])
+    eta = ""
+    if per_hour > 0 and remaining > 0:
+        eta = f", eta {_fmt_duration(remaining / per_hour * 3600)} at {per_hour:.0f}/hr"
+    logger.info(
+        "PROGRESS %s/%s done (%.1f%%) | %d this run | pending %d, failed %d, dead %d%s",
+        f"{done:,}", f"{total:,}", pct, this_run,
+        int(r["pending"]), int(r["failed"]), int(r["dead"]), eta,
+    )
 
 
 async def count_outstanding(pool: asyncpg.Pool) -> int:
@@ -1007,7 +1053,11 @@ async def drain(
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
             processed += len(tasks)
-            logger.info("progress: %d processed this run", processed)
+            elapsed = time.time() - pipeline.started_at
+            per_hour = (
+                pipeline.stats["succeeded"] / (elapsed / 3600) if elapsed > 0 else 0.0
+            )
+            await log_progress(pool, processed, per_hour)
 
 
 def token_cost(prompt_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
